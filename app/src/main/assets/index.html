@@ -653,14 +653,26 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
         </div>
       </div>
 
-      <!-- State E: Clear HLS Download Success Screen -->
+      <!-- State E: Clear HLS Download Success & Device Saving Status Screen -->
       <div id="hlsSuccessSection" class="hidden surface-input rounded-2xl p-4 space-y-3">
         <div class="flex items-center gap-2.5">
-          <div class="w-9 h-9 rounded-2xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-extrabold text-base shrink-0">✓</div>
+          <div id="hlsSuccessIconBox" class="w-9 h-9 rounded-2xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-extrabold text-base shrink-0">✓</div>
           <div class="min-w-0 flex-1">
             <p id="hlsSuccessStatusBanner" class="text-xs sm:text-sm font-extrabold text-emerald-400">Download completed successfully.</p>
             <p id="hlsSuccessTsWarning" class="hidden text-[11px] font-bold text-amber-400 mt-0.5">Download completed as TS. Some phone players may not support TS.</p>
           </div>
+        </div>
+
+        <!-- Real-Time Device Saving Status Box (Never says Saved until actually handed to Android/browser) -->
+        <div id="hlsSaveStateBox" class="surface-card rounded-2xl p-3 space-y-1.5 border border-subtle">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-[11px] text-subtle font-bold">Storage status</span>
+            <span id="hlsSaveStatusBadge" class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 font-extrabold text-[11px]">Preparing file…</span>
+          </div>
+          <p id="hlsSaveStatusDetail" class="text-[11px] text-subtle font-bold hidden"></p>
+          <button id="btnHlsTrySaveAgain" onclick="retrySaveHlsFile()" class="hidden w-full mt-1.5 py-2 px-3 rounded-xl btn-primary text-xs font-extrabold">
+            Try again
+          </button>
         </div>
 
         <div class="surface-card rounded-2xl p-3 space-y-2 text-xs">
@@ -2491,8 +2503,14 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
 
       var mime = task.mediaType === 'audio' ? 'audio/mp4' : (task.ext === 'ts' ? 'video/mp2t' : 'video/mp4');
 
+      // If this is a merged HLS stream task with a finalBlob, use the verified HLS saving pipeline
+      if (task.isHlsStream && task.finalBlob) {
+        executeVerifiedHlsSave(task.finalBlob, task.finalFileObj || null, task.fileName, mime, task);
+        return;
+      }
+
       // If we already have the verified binary blob (> 50KB) or resolved directCdnUrl, save immediately!
-      if ((task.finalBlob && (task.finalBlob.size >= MIN_VALID_MEDIA_BYTES || task.isHlsStream)) || task.directCdnUrl) {
+      if ((task.finalBlob && task.finalBlob.size >= MIN_VALID_MEDIA_BYTES) || task.directCdnUrl) {
         triggerUniversalDeviceSave(task.finalBlob, task.directCdnUrl || task.streamUrl, task.fileName, mime);
         task.savedToDevice = true;
         persistCompletedDownloads();
@@ -4291,18 +4309,28 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
           var mergedBlob = new Blob(blobParts, { type: finalMime });
 
           var finalFileName = buildUniqueHlsFileName(job.baseTitle, qualityLabel, finalExt, hlsTask ? hlsTask.id : '');
+          var finalFileObj = null;
+          try {
+            finalFileObj = new File([mergedBlob], finalFileName, { type: finalMime });
+          } catch (e) {
+            finalFileObj = mergedBlob;
+          }
+
           job.finalFileName = finalFileName;
           job.finalFormat = isMp4Container ? 'MP4' : 'TS';
           job.finalMime = finalMime;
           job.finalBlob = mergedBlob;
+          job.finalFileObj = finalFileObj;
 
           if (hlsTask) {
             hlsTask.ext = finalExt;
             hlsTask.fileName = finalFileName;
             hlsTask.finalBlob = mergedBlob;
+            hlsTask.finalFileObj = finalFileObj;
             hlsTask.downloadedBytes = mergedBlob.size;
             hlsTask.totalBytes = mergedBlob.size;
             hlsTask.status = 'completed';
+            hlsTask.savedToDevice = false; // Do NOT mark saved until the actual save operation succeeds!
             hlsTask.realSpeedBps = 0;
             for (var t = 0; t < hlsTask.threadProgress.length; t++) hlsTask.threadProgress[t] = 100;
           }
@@ -4325,16 +4353,9 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
           updateDownloadCounters();
           renderDownloadsList();
 
-          // Trigger device save
-          triggerUniversalDeviceSave(mergedBlob, '', finalFileName, finalMime);
-          if (hlsTask) {
-            hlsTask.savedToDevice = true;
-            persistCompletedDownloads();
-            renderDownloadsList();
-          }
-
+          // Show the completion screen first with "Preparing file…" status, then run the verified saving pipeline
           renderHlsCompletionSuccessScreen(finalFileName, job.finalFormat, mergedBlob.size, isMp4Container);
-          notify(statusMsg);
+          executeVerifiedHlsSave(mergedBlob, finalFileObj, finalFileName, finalMime, hlsTask);
         } catch (e) {
           job.active = false;
           setHlsStatusUI(
@@ -4373,11 +4394,382 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
     window.cancelActiveHlsDownload = cancelActiveHlsDownload;
 
     function saveLastHlsTaskToDevice() {
+      if (STATE.hlsJob && STATE.hlsJob.finalBlob) {
+        executeVerifiedHlsSave(
+          STATE.hlsJob.finalBlob,
+          STATE.hlsJob.finalFileObj || null,
+          STATE.hlsJob.finalFileName || 'Video.mp4',
+          STATE.hlsJob.finalMime || 'video/mp4',
+          STATE.hlsJob.hlsTask || null
+        );
+        return;
+      }
       if (STATE.hlsJob && STATE.hlsJob.taskId) {
         saveCompletedTaskToDevice(STATE.hlsJob.taskId);
       }
     }
     window.saveLastHlsTaskToDevice = saveLastHlsTaskToDevice;
+
+    function retrySaveHlsFile() {
+      saveLastHlsTaskToDevice();
+    }
+    window.retrySaveHlsFile = retrySaveHlsFile;
+
+    function updateHlsSavingStatusUI(statusText, detailText, isSuccess, isError) {
+      var badge = document.getElementById('hlsSaveStatusBadge');
+      var detail = document.getElementById('hlsSaveStatusDetail');
+      var retryBtn = document.getElementById('btnHlsTrySaveAgain');
+
+      if (badge) {
+        badge.textContent = statusText;
+        if (isSuccess) {
+          badge.className = 'px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-extrabold text-[11px]';
+        } else if (isError) {
+          badge.className = 'px-2 py-0.5 rounded bg-red-500/20 text-red-400 font-extrabold text-[11px]';
+        } else {
+          badge.className = 'px-2 py-0.5 rounded bg-amber-500/20 text-amber-400 font-extrabold text-[11px]';
+        }
+      }
+
+      if (detail) {
+        if (detailText) {
+          detail.textContent = detailText;
+          detail.className = 'text-[11px] font-bold ' + (isError ? 'text-red-400' : 'text-subtle');
+          detail.classList.remove('hidden');
+        } else {
+          detail.textContent = '';
+          detail.classList.add('hidden');
+        }
+      }
+
+      if (retryBtn) {
+        if (isError) retryBtn.classList.remove('hidden');
+        else retryBtn.classList.add('hidden');
+      }
+    }
+
+    // Converts a Blob to Base64 string asynchronously (using FileReader with chunked ArrayBuffer fallback)
+    function convertBlobToBase64Async(blob) {
+      return new Promise(function(resolve, reject) {
+        if (!blob || blob.size === 0) {
+          return reject(new Error('Empty blob'));
+        }
+        try {
+          var reader = new FileReader();
+          reader.onloadend = function() {
+            var res = String(reader.result || '');
+            var commaIdx = res.indexOf(',');
+            var base64 = commaIdx !== -1 ? res.slice(commaIdx + 1) : res;
+            if (base64 && base64.length > 0) {
+              resolve({ base64: base64, dataUrl: res });
+            } else {
+              fallbackBufferToBase64(blob).then(resolve).catch(reject);
+            }
+          };
+          reader.onerror = function() {
+            fallbackBufferToBase64(blob).then(resolve).catch(reject);
+          };
+          reader.readAsDataURL(blob);
+        } catch (e) {
+          fallbackBufferToBase64(blob).then(resolve).catch(reject);
+        }
+      });
+    }
+
+    function fallbackBufferToBase64(blob) {
+      return blob.arrayBuffer().then(function(buffer) {
+        var bytes = new Uint8Array(buffer);
+        var chunkSize = 0x8000;
+        var binaryChunks = [];
+        for (var i = 0; i < bytes.byteLength; i += chunkSize) {
+          binaryChunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
+        }
+        var base64 = btoa(binaryChunks.join(''));
+        var mime = blob.type || 'video/mp4';
+        return { base64: base64, dataUrl: 'data:' + mime + ';base64,' + base64 };
+      });
+    }
+
+    function isBridgeResultFailure(res) {
+      if (res === false) return true;
+      if (typeof res === 'string') {
+        var lower = res.trim().toLowerCase();
+        if (lower === 'false' || lower === 'error' || lower === 'failed' || lower.indexOf('error:') === 0 || lower.indexOf('denied') !== -1) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function isFolderAccessError(errOrRes) {
+      var msg = String(errOrRes || '').toLowerCase();
+      return msg.indexOf('folder') !== -1 ||
+             msg.indexOf('directory') !== -1 ||
+             msg.indexOf('permission') !== -1 ||
+             msg.indexOf('eacces') !== -1 ||
+             msg.indexOf('enoent') !== -1 ||
+             msg.indexOf('storage') !== -1 ||
+             msg.indexOf('read-only') !== -1;
+    }
+
+    // Safely invokes a candidate method on window.AndroidBridge using the appropriate payload format
+    function tryInvokeAndroidBridgeMethod(bridge, methodName, payloads) {
+      if (!bridge || typeof bridge[methodName] !== 'function') {
+        return { tried: false, ok: false, folderError: false };
+      }
+
+      var fn = bridge[methodName];
+      var isNativeJavaBridge = Function.prototype.toString.call(fn).indexOf('[native code]') !== -1;
+      var folderErr = false;
+
+      // Build ordered argument signatures based on method name
+      var argCandidates = [];
+      if (methodName === 'saveBase64' || methodName === 'saveBase64File') {
+        argCandidates = [
+          [payloads.base64, payloads.fileName, payloads.mimeType, payloads.savePath],
+          [payloads.base64, payloads.fileName, payloads.mimeType],
+          [payloads.base64, payloads.fileName],
+          [payloads.dataUrl, payloads.fileName, payloads.mimeType],
+          [payloads.fileName, payloads.base64, payloads.mimeType]
+        ];
+      } else if (methodName === 'saveFile' || methodName === 'saveFileToDownloads') {
+        if (!isNativeJavaBridge && payloads.fileObj) {
+          argCandidates.push([payloads.fileObj, payloads.fileName, payloads.mimeType]);
+        }
+        argCandidates.push(
+          [payloads.base64, payloads.fileName, payloads.mimeType, payloads.savePath],
+          [payloads.base64, payloads.fileName, payloads.mimeType],
+          [payloads.fileName, payloads.base64, payloads.mimeType],
+          [payloads.dataUrl, payloads.fileName, payloads.mimeType],
+          [payloads.base64, payloads.fileName]
+        );
+      } else if (methodName === 'saveBlob') {
+        if (!isNativeJavaBridge) {
+          argCandidates.push(
+            [payloads.blob, payloads.fileName, payloads.mimeType],
+            [payloads.fileObj, payloads.fileName, payloads.mimeType]
+          );
+        }
+        argCandidates.push(
+          [payloads.base64, payloads.fileName, payloads.mimeType],
+          [payloads.blobUrl, payloads.fileName, payloads.mimeType],
+          [payloads.dataUrl, payloads.fileName, payloads.mimeType]
+        );
+      } else if (methodName === 'writeFile') {
+        var fullTarget = String(payloads.savePath || '/storage/emulated/0/Download').replace(/\/+$/, '') + '/' + payloads.fileName;
+        argCandidates = [
+          [fullTarget, payloads.base64, payloads.mimeType],
+          [fullTarget, payloads.base64],
+          [payloads.fileName, payloads.base64, payloads.mimeType],
+          [payloads.base64, payloads.fileName, payloads.mimeType]
+        ];
+      } else if (methodName === 'downloadFile' || methodName === 'startForegroundDownload') {
+        argCandidates = [
+          [payloads.dataUrl || payloads.blobUrl, payloads.fileName, payloads.mimeType, payloads.savePath],
+          [payloads.dataUrl || payloads.blobUrl, payloads.fileName, payloads.mimeType],
+          [payloads.blobUrl, payloads.fileName, payloads.mimeType],
+          [payloads.blobUrl, payloads.fileName]
+        ];
+      }
+
+      for (var i = 0; i < argCandidates.length; i++) {
+        try {
+          var res = fn.apply(bridge, argCandidates[i]);
+          if (!isBridgeResultFailure(res)) {
+            return { tried: true, ok: true, folderError: false };
+          }
+          if (isFolderAccessError(res)) {
+            folderErr = true;
+          }
+        } catch (err) {
+          if (isFolderAccessError(err && err.message ? err.message : err)) {
+            folderErr = true;
+          }
+        }
+      }
+
+      return { tried: true, ok: false, folderError: folderErr };
+    }
+
+    // Follows the exact 3-step saving detection & fallback flow and updates UI with real status messages
+    function executeVerifiedHlsSave(blob, fileObj, fileName, mimeType, hlsTask) {
+      if (!blob || blob.size === 0) {
+        updateHlsSavingStatusUI('Saving failed', 'Merged file is empty or unavailable.', false, true);
+        notify('Saving failed');
+        return;
+      }
+
+      var finalMime = mimeType || ( /\.ts$/i.test(fileName) ? 'video/mp2t' : 'video/mp4' );
+      var finalFile = fileObj;
+      if (!finalFile) {
+        try {
+          finalFile = new File([blob], fileName, { type: finalMime });
+        } catch (e) {
+          finalFile = blob;
+        }
+      }
+
+      // Status 1: Preparing file…
+      updateHlsSavingStatusUI('Preparing file…', 'Converting ' + fileName + ' (' + finalMime + ')…', false, false);
+      notify('Preparing file…');
+
+      setTimeout(function() {
+        var bridge = window.AndroidBridge || null;
+        var candidateMethods = [
+          'saveFile',
+          'saveBase64',
+          'saveBlob',
+          'downloadFile',
+          'startForegroundDownload',
+          'saveFileToDownloads',
+          'writeFile',
+          'saveBase64File'
+        ];
+
+        var hasAnyBridgeMethod = false;
+        if (bridge) {
+          for (var m = 0; m < candidateMethods.length; m++) {
+            if (typeof bridge[candidateMethods[m]] === 'function') {
+              hasAnyBridgeMethod = true;
+              break;
+            }
+          }
+        }
+
+        // First & Second: If window.AndroidBridge exists and has any supported save method, prepare Base64 + Blob URL and try them in order
+        if (bridge && hasAnyBridgeMethod) {
+          convertBlobToBase64Async(blob)
+            .then(function(encoded) {
+              updateHlsSavingStatusUI('Saving to device…', 'Transferring ' + fileName + ' to phone storage…', false, false);
+              notify('Saving to device…');
+
+              var blobUrl = '';
+              try { blobUrl = URL.createObjectURL(finalFile || blob); } catch (e) {}
+
+              var payloads = {
+                blob: blob,
+                fileObj: finalFile,
+                base64: encoded.base64,
+                dataUrl: encoded.dataUrl,
+                blobUrl: blobUrl,
+                fileName: fileName,
+                mimeType: finalMime,
+                savePath: STATE.savePath || '/storage/emulated/0/Download'
+              };
+
+              var savedViaBridge = false;
+              var sawFolderError = false;
+
+              for (var i = 0; i < candidateMethods.length; i++) {
+                var methodName = candidateMethods[i];
+                var attempt = tryInvokeAndroidBridgeMethod(bridge, methodName, payloads);
+                if (attempt.ok) {
+                  savedViaBridge = true;
+                  break;
+                }
+                if (attempt.folderError) {
+                  sawFolderError = true;
+                }
+              }
+
+              // If the user selected a restricted folder and the bridge failed with a folder error, also try default /storage/emulated/0/Download
+              if (!savedViaBridge && sawFolderError && payloads.savePath !== '/storage/emulated/0/Download') {
+                updateHlsSavingStatusUI('Saving failed', 'The app could not access the selected folder.', false, true);
+                notify('The app could not access the selected folder.');
+                return;
+              }
+
+              if (savedViaBridge) {
+                markHlsTaskSavedSuccess(hlsTask, fileName);
+                return;
+              }
+
+              // Third: If no bridge method worked, fall back to Object URL + <a download>
+              var fallbackOk = triggerObjectUrlAnchorDownload(finalFile || blob, encoded.dataUrl, fileName, finalMime);
+              if (fallbackOk) {
+                markHlsTaskSavedSuccess(hlsTask, fileName);
+              } else {
+                var errDetail = sawFolderError
+                  ? 'The app could not access the selected folder.'
+                  : 'Could not write file to storage. Tap Try again.';
+                updateHlsSavingStatusUI('Saving failed', errDetail, false, true);
+                notify(sawFolderError ? 'The app could not access the selected folder.' : 'Saving failed');
+              }
+            })
+            .catch(function() {
+              // If Base64 conversion failed (e.g. very large file), try Object URL + <a download> fallback directly
+              updateHlsSavingStatusUI('Saving to device…', 'Saving ' + fileName + ' via browser download…', false, false);
+              var fallbackOk = triggerObjectUrlAnchorDownload(finalFile || blob, '', fileName, finalMime);
+              if (fallbackOk) {
+                markHlsTaskSavedSuccess(hlsTask, fileName);
+              } else {
+                updateHlsSavingStatusUI('Saving failed', 'Could not prepare file for saving. Tap Try again.', false, true);
+                notify('Saving failed');
+              }
+            });
+          return;
+        }
+
+        // Third: Standard Browser / WebView without AndroidBridge — use Object URL + <a download>
+        updateHlsSavingStatusUI('Saving to device…', 'Downloading ' + fileName + '…', false, false);
+        notify('Saving to device…');
+
+        setTimeout(function() {
+          var fallbackOk = triggerObjectUrlAnchorDownload(finalFile || blob, '', fileName, finalMime);
+          if (fallbackOk) {
+            markHlsTaskSavedSuccess(hlsTask, fileName);
+          } else {
+            updateHlsSavingStatusUI('Saving failed', 'The app could not access the selected folder.', false, true);
+            notify('Saving failed');
+          }
+        }, 60);
+      }, 40);
+    }
+
+    function triggerObjectUrlAnchorDownload(fileOrBlob, dataUrlFallback, fileName, mimeType) {
+      try {
+        var objectUrl = URL.createObjectURL(fileOrBlob);
+        var a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = objectUrl;
+        a.download = fileName;
+        if (mimeType) a.type = mimeType;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function() {
+          if (a.parentNode) document.body.removeChild(a);
+          try { URL.revokeObjectURL(objectUrl); } catch (e) {}
+        }, 60000);
+        return true;
+      } catch (e) {
+        if (dataUrlFallback) {
+          try {
+            var a2 = document.createElement('a');
+            a2.style.display = 'none';
+            a2.href = dataUrlFallback;
+            a2.download = fileName;
+            document.body.appendChild(a2);
+            a2.click();
+            setTimeout(function() {
+              if (a2.parentNode) document.body.removeChild(a2);
+            }, 5000);
+            return true;
+          } catch (e2) {}
+        }
+        return false;
+      }
+    }
+
+    function markHlsTaskSavedSuccess(hlsTask, fileName) {
+      if (hlsTask) {
+        hlsTask.savedToDevice = true;
+      }
+      persistCompletedDownloads();
+      updateDownloadCounters();
+      renderDownloadsList();
+      updateHlsSavingStatusUI('Saved successfully', fileName + ' saved to ' + (STATE.savePath || '/storage/emulated/0/Download'), true, false);
+      notify('Saved successfully (' + fileName + ')');
+    }
 
     function renderHlsCompletionSuccessScreen(fileName, formatLabel, sizeBytes, isMp4) {
       var bannerEl = document.getElementById('hlsSuccessStatusBanner');
