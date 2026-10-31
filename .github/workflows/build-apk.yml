@@ -51,6 +51,6 @@ jobs:
       - name: Publish Direct Release APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v-1793442366267
+          tag_name: v-1793442997376
           name: "Poijhdrrthgffffh (1.0.0)"
           files: com_studio_jgfbghyjgygg.apk
